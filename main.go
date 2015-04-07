@@ -1,4 +1,5 @@
 package main
+
 import (
     "github.com/gorilla/websocket"
     "net/http"
@@ -15,23 +16,22 @@ var upgrader = &websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
 //-----------------------------------------------
 
 type Hub struct {
-    clients     map[*Client]bool
+    clients         map[*Client]bool
     broadcast       chan []byte
     register        chan *Client
     unregister      chan *Client
 }
 
-func (h *Hub) Join(conn *Client) {
-    //add hub to connection
-    conn.hub = h
-
-    //register with hub
+func (h *Hub) Register(conn *Client) {
     h.register <- conn
 }
 
-func (h *Hub) CloseConnection(client *Client) {
-    //remove connection
+func (h *Hub) Unregister(client *Client) {
     h.unregister <- client
+}
+
+func (h *Hub) Broadcast(msg []byte) {
+    h.broadcast <- msg
 }
 
 func (h *Hub) Run() {
@@ -40,9 +40,9 @@ func (h *Hub) Run() {
 
         //new client
         case conn := <-h.register:
-            //do add
             h.clients[conn] = true
-            log.Print("client connected")
+            //important: never block Run
+            go h.Broadcast([]byte("client joined"))
 
         //client disconnects
         case conn := <-h.unregister:
@@ -50,7 +50,7 @@ func (h *Hub) Run() {
                 //do remove
                 delete(h.clients, conn)
                 close(conn.send)
-                log.Print("client left")
+                go h.Broadcast([]byte("client left"))
             }
 
         //new message
@@ -64,11 +64,10 @@ func (h *Hub) Run() {
 
 func NewHub() *Hub {
     return &Hub{
-        broadcast:   make(chan []byte),
+        broadcast:   make(chan []byte, 64),
         register:    make(chan *Client),
         unregister:  make(chan *Client),
         clients:     make(map[*Client]bool),
-
     }
 }
 
@@ -82,11 +81,18 @@ type Client struct {
     hub *Hub
 }
 
-func (client *Client) LeaveHub() {
-    client.hub.CloseConnection(client)
+func (client *Client) JoinHub(hub *Hub) {
+    client.hub = hub
+    client.hub.Register(client)
 }
 
-func (client *Client) Disconnect() {
+func (client *Client) LeaveHub() {
+    if (client.hub != nil) {
+        client.hub.Unregister(client)
+    }
+}
+
+func (client *Client) Close() {
     client.LeaveHub()
     client.conn.Close()
 }
@@ -95,34 +101,33 @@ func (client *Client) Send(msg []byte) {
     select {
     case  client.send <- msg:
     default:
-        //seems the client's buffer is full - they're probably dead
-        log.Print("Client buffer full")
-        client.Disconnect()
+        log.Print("client send buffer is full - they're probably dead so they've been disconnected")
+        client.Close()
     }
 }
 
+// AcceptMessages accepts messages from client and re-broadcasts to other clients
 func (client *Client) AcceptMessages() {
 
-    defer client.Disconnect()
+    defer client.Close()
 
     for {
         _, msg, err := client.conn.ReadMessage()
         if err != nil {
-            log.Print(err)
-            break;
+            break
         }
-        client.hub.broadcast <- msg
+        client.hub.Broadcast(msg)
     }
 }
 
+// RelayMessages sends messages from other clients to client
 func (client *Client) RelayMessages() {
 
-    defer client.Disconnect()
+    defer client.Close()
 
     for msg := range client.send {
         if err := client.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-            log.Print(err);
-            break;
+            break
         }
     }
 }
@@ -137,19 +142,20 @@ type WebsocketHandler struct {
 
 func (handler *WebsocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-    sock, err := upgrader.Upgrade(w, r, nil);
+    conn, err := upgrader.Upgrade(w, r, nil)
     if err != nil {
+        log.Print("socket upgrade failed: ", err)
         return
     }
 
     //open new client connection
-    client := &Client{send: make(chan []byte, 256), conn: sock}
+    client := &Client{send: make(chan []byte, 256), conn: conn}
 
-    //connect to hub
-    handler.Hub.Join(client)
+    //join the hub
+    client.JoinHub(handler.Hub)
 
     //unregister on connection close
-    defer client.Disconnect()
+    defer client.Close()
 
     //start relaying messages to client
     go client.RelayMessages()
@@ -158,22 +164,15 @@ func (handler *WebsocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
     client.AcceptMessages()
 }
 
-
 //-----------------------------------------------
 // Main
 //-----------------------------------------------
 
-
 func main() {
-
-    var (
-        addr      = flag.String("addr", ":8080", "http service address")
-        static    = flag.String("static", "./static" , "path to static files")
-    )
 
     flag.Parse()
 
-    indexTemplate := template.Must(template.ParseFiles(filepath.Join(*static, "index.html")))
+    indexTemplate := template.Must(template.ParseFiles(filepath.Join(*flag.String("static", "./static" , "path to static files"), "index.html")))
 
     hub := NewHub()
     go hub.Run()
@@ -186,7 +185,7 @@ func main() {
     //websockets
     http.Handle("/ws", &WebsocketHandler{Hub: hub})
 
-    if err := http.ListenAndServe(*addr, nil); err != nil {
+    if err := http.ListenAndServe(*flag.String("addr", ":8080", "http service address"), nil); err != nil {
         log.Fatal("HTTP Server failed: ", err)
     }
 }

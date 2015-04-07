@@ -15,62 +15,48 @@ var upgrader = &websocket.Upgrader{ReadBufferSize: 1024, WriteBufferSize: 1024}
 //-----------------------------------------------
 
 type Hub struct {
-    connections     map[*Client]bool
+    clients     map[*Client]bool
     broadcast       chan []byte
     register        chan *Client
     unregister      chan *Client
 }
 
-func (h *Hub) NewConnection(conn *Client) *Client {
-
+func (h *Hub) Join(conn *Client) {
     //add hub to connection
     conn.hub = h
 
     //register with hub
     h.register <- conn
-
-    //notify
-    h.Broadcast("Peer Connected")
-
-    return conn
 }
 
 func (h *Hub) CloseConnection(client *Client) {
     //remove connection
     h.unregister <- client
-
-    //notify
-    h.Broadcast("Peer Disconnected")
-}
-
-func (h *Hub) Broadcast(msg string) {
-    h.broadcast <- []byte(msg)
 }
 
 func (h *Hub) Run() {
     for {
         select {
 
-        //New Client
+        //new client
         case conn := <-h.register:
-            h.connections[conn] = true
+            //do add
+            h.clients[conn] = true
+            log.Print("client connected")
 
-        //Client Disconnects
+        //client disconnects
         case conn := <-h.unregister:
-            if _, ok := h.connections[conn]; ok {
-                delete(h.connections, conn)
+            if _, ok := h.clients[conn]; ok {
+                //do remove
+                delete(h.clients, conn)
                 close(conn.send)
+                log.Print("client left")
             }
 
-        //New Message
+        //new message
         case msg := <-h.broadcast:
-            for conn := range h.connections {
-                select {
-                case conn.send <- msg:
-                default:
-                    delete(h.connections, conn)
-                    close(conn.send)
-                }
+            for client := range h.clients {
+                client.Send(msg)
             }
         }
     }
@@ -81,7 +67,7 @@ func NewHub() *Hub {
         broadcast:   make(chan []byte),
         register:    make(chan *Client),
         unregister:  make(chan *Client),
-        connections: make(map[*Client]bool),
+        clients:     make(map[*Client]bool),
 
     }
 }
@@ -91,11 +77,8 @@ func NewHub() *Hub {
 //-----------------------------------------------
 
 type Client struct {
-
     conn *websocket.Conn
-
     send chan []byte
-
     hub *Hub
 }
 
@@ -104,28 +87,41 @@ func (client *Client) LeaveHub() {
 }
 
 func (client *Client) Disconnect() {
+    client.LeaveHub()
     client.conn.Close()
 }
 
-func (client *Client) Reader() {
+func (client *Client) Send(msg []byte) {
+    select {
+    case  client.send <- msg:
+    default:
+        //seems the client's buffer is full - they're probably dead
+        log.Print("Client buffer full")
+        client.Disconnect()
+    }
+}
+
+func (client *Client) AcceptMessages() {
 
     defer client.Disconnect()
 
     for {
         _, msg, err := client.conn.ReadMessage()
         if err != nil {
+            log.Print(err)
             break;
         }
         client.hub.broadcast <- msg
     }
 }
 
-func (client *Client) Writer() {
+func (client *Client) RelayMessages() {
 
     defer client.Disconnect()
 
     for msg := range client.send {
         if err := client.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+            log.Print(err);
             break;
         }
     }
@@ -150,16 +146,16 @@ func (handler *WebsocketHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
     client := &Client{send: make(chan []byte, 256), conn: sock}
 
     //connect to hub
-    handler.Hub.NewConnection(client)
+    handler.Hub.Join(client)
 
     //unregister on connection close
-    defer client.LeaveHub()
+    defer client.Disconnect()
 
-    //start writing
-    go client.Writer()
+    //start relaying messages to client
+    go client.RelayMessages()
 
-    //start reading
-    client.Reader()
+    //start accepting messages from
+    client.AcceptMessages()
 }
 
 
